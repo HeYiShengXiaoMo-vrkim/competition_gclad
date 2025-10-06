@@ -128,16 +128,51 @@ parser.add_argument('--blank', type=int, default=0, help='use during find best h
 parser.add_argument('--IR', type=float, default=0.1, help='imbalanced ratio.')
 parser.add_argument('--IR_set', type=int, default=0, help='whether to set imbalanced ratio,1 for set ,0 for not.')
 parser.add_argument('--cost', type=int, default=2, help="set the way to calculate cost matrix,0:'uniform',1:'inverse',2:'log1p-inverse' ")
+parser.add_argument('--layer_pause', type=float, default=0.0, help='Seconds to sleep after each layer (debug, default 0).')
+parser.add_argument('--print_test', action='store_true', help='Print test metrics at each print interval.')
+parser.add_argument('--no_tqdm', action='store_true', help='Disable tqdm progress bar for cleaner logs.')
 args = parser.parse_args()
 #print(args)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Robust device selection: some environments may have a CUDA-enabled PyTorch build
+# but only a CPU build of DGL (e.g. installed "dgl" instead of "dgl-cu117").
+# Attempt to confirm DGL's CUDA availability; if unavailable, fall back to CPU to
+# avoid: DGLError: Device API gpu is not enabled. Please install the cuda version of dgl.
+def select_device():
+    want_cuda = torch.cuda.is_available()
+    if not want_cuda:
+        return torch.device('cpu')
+    # DGL 0.x provides dgl.cuda.is_available(); if missing or False -> fallback.
+    try:
+        import dgl
+        if hasattr(dgl, 'cuda') and hasattr(dgl.cuda, 'is_available'):
+            if dgl.cuda.is_available():
+                return torch.device('cuda')
+            else:
+                logging.warning("DGL CUDA 不可用，自动回退到 CPU（请安装 GPU 版 dgl，如 dgl-cu117）")
+                return torch.device('cpu')
+        else:
+            # If attribute not present, optimistic try
+            test_g = dgl.graph((torch.tensor([0]), torch.tensor([0])))
+            try:
+                test_g.to('cuda')
+                return torch.device('cuda')
+            except Exception:
+                logging.warning("无法将测试图移动到 GPU，回退 CPU。")
+                return torch.device('cpu')
+    except Exception:
+        return torch.device('cpu')
+
+device = select_device()
+logging.log(25, f"使用设备: {device}")
 
 setup_seed(args.seed)
 
-def beijing(sec,what):
-    beijing_time = datetime.datetime.now() + datetime.timedelta(hours=0)
-    return beijing_time.timetuple()
-logging.Formatter.converter = beijing
+def beijing_converter(secs: float):
+    """Custom time converter (keeps local time); signature must accept a single argument.
+    If you want to shift timezone, adjust timedelta here."""
+    return (datetime.datetime.now()).timetuple()
+logging.Formatter.converter = beijing_converter
 
 # logging configuration
 log_name=(datetime.datetime.now() + datetime.timedelta(hours=0)).strftime('%Y-%m-%d')
@@ -168,10 +203,11 @@ elif args.dataset == 'BUPT':
 else:
     raise Exception("Dataset dosen't exist!")
 
+"""Move graph to device once; then normalize self-loops per edge type."""
+g = g.int().to(device)
 for e in g.etypes:
-    g = g.int().to(device)
-    dgl.remove_self_loop(g,etype=e)
-    dgl.add_self_loop(g,etype=e)
+    dgl.remove_self_loop(g, etype=e)
+    dgl.add_self_loop(g, etype=e)
 
 features = g.ndata['feat'].float()
 features_alpha=features
@@ -237,7 +273,10 @@ for layer in range(args.layers):
         stopper.counter = 0
 
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=args.weight_decay)
-    for epoch in tqdm(range(args.epochs), desc=f"Layer {layer + 1}/8", unit="epoch", leave=False):
+    epoch_iter = range(args.epochs)
+    if not args.no_tqdm:
+        epoch_iter = tqdm(epoch_iter, desc=f"Layer {layer + 1}/{args.layers}", unit="epoch", leave=False)
+    for epoch in epoch_iter:
         model.train()
         time.sleep(0.1)
         logits, logits_GAT, _ = model(features)
@@ -254,24 +293,24 @@ for layer in range(args.layers):
 
 
         with torch.no_grad():
-            val_acc, val_loss, val_logits = evaluate(model, features, labels, val_mask)
+            val_acc, val_loss, _ = evaluate(model, features, labels, val_mask)
+            if args.print_test:
+                test_acc_interval, test_loss_interval, _ = evaluate(model, features, labels, test_mask)
 
         if epoch % args.print_interval == 0:
             duration = time.time() - last_time  # each interval including training and early-stopping
             last_time = time.time()
-            if args.early_stop:
-                logging.info(f"Epoch {epoch}: "
-                             f"Train loss = {train_loss:.2f}, "
-                             f"Train acc = {train_acc * 100:.1f}, "
-                             f"Validation loss = {val_loss:.2f}, "
-                             f"Validation acc = {val_acc * 100:.1f} "
-                             f"({duration:.3f} sec)")
-            else:
-                logging.info(f"Epoch {epoch}: "
-                             f"Train loss = {train_loss:.2f}, "
-                             f"train acc = {train_acc * 100:.1f}, "
-                             f"Validation loss = {val_loss:.2f}, "  # Include validation loss here
-                             f"({duration:.3f} sec)")
+            log_msg = [
+                f"Epoch {epoch}",
+                f"TrainLoss={train_loss:.3f}",
+                f"TrainAcc={train_acc * 100:.2f}%",
+                f"ValLoss={val_loss:.3f}",
+                f"ValAcc={val_acc * 100:.2f}%",
+                f"Δt={duration:.2f}s"
+            ]
+            if args.print_test:
+                log_msg.append(f"TestAcc={test_acc_interval * 100:.2f}%")
+            logging.info(" | ".join(log_msg))
 
         # save model parameters with early stopping
         if args.early_stop:
@@ -292,7 +331,6 @@ for layer in range(args.layers):
         print("early_stop")
     with torch.no_grad():
         ada_use_h,_, attention = model(features)
-        # _,ada_use_h, attention = model(features)
 
 
     attention = torch.reshape(attention, [attention.shape[0], -1])
@@ -306,16 +344,14 @@ for layer in range(args.layers):
     test_acc = torch.sum(test_h == labels[test_mask]) * 1.0 / len(labels[test_mask])
 
     with torch.no_grad():
-        test_acc, test_loss, test_logits = evaluate(model, features_alpha, labels, train_mask)
-        if test_acc > max_acc:
-            max_acc = test_acc
-            # 保存模型到当前目录的models文件夹
-            import os
-
+        # Properly evaluate on validation & test sets
+        current_test_acc, _, _ = evaluate(model, features_alpha, labels, test_mask)
+        current_val_acc, _, _ = evaluate(model, features_alpha, labels, val_mask)
+        if current_test_acc > max_acc:
+            max_acc = current_test_acc
             os.makedirs('./models', exist_ok=True)
             torch.save(model.state_dict(), './models/gat_cobo_model.pth')
-            # print("save successfully!")
-        # print(test_acc)
+            logging.log(24, f"[Layer {layer+1}] 模型已保存 (TestAcc={current_test_acc*100:.2f}%, ValAcc={current_val_acc*100:.2f}%)")
 
 
     # cost calculation
@@ -333,14 +369,19 @@ for layer in range(args.layers):
     sample_weights = weight.detach().to(device)
 
 
-    row=g.edges()[0].cpu().detach().numpy()
-    column=g.edges()[1].cpu().detach().numpy()
-    data=attention.cpu().detach().numpy().T.squeeze()
-    shape=[g.ndata['feat'].shape[0], g.ndata['feat'].shape[0]]
-    attention=torch.sparse_coo_tensor(torch.tensor([row,column]).to(device), torch.tensor(data).to(device),shape)
-
-    features = torch.sparse.mm(args.attention_weight * attention, args.feature_weight * features).detach()
-    time.sleep(200)
+    # Efficient sparse attention construction
+    row = g.edges()[0].cpu().numpy()
+    column = g.edges()[1].cpu().numpy()
+    data = attention.cpu().numpy().T.squeeze()
+    shape = (g.num_nodes(), g.num_nodes())
+    row_t = torch.from_numpy(row).to(device)
+    col_t = torch.from_numpy(column).to(device)
+    data_t = torch.from_numpy(data).to(device)
+    att_idx = torch.stack([row_t, col_t])
+    attention_sparse = torch.sparse_coo_tensor(att_idx, data_t, shape)
+    features = torch.sparse.mm(args.attention_weight * attention_sparse, args.feature_weight * features).detach()
+    if args.layer_pause > 0:
+        time.sleep(args.layer_pause)
 # final result evaluation
 runtime = time.time() - start_time
 val_h = torch.argmax(results[val_mask], dim=1)
@@ -352,9 +393,9 @@ test_h = torch.argmax(results[test_mask], dim=1)
 test_acc = torch.sum(test_h == labels[test_mask]) * 1.0 / len(labels[test_mask])
 test_f1 = f1_score(labels[test_mask].cpu(),test_h.cpu(),  average='macro')
 test_gmean=geometric_mean_score(labels[test_mask].cpu(),test_h.cpu())
-logging.log(23,f"The runtime: {runtime:.2f}s ")
-logging.log(23,f"Test macro F1: {test_f1 * 100:.1f}%   Test accuracy: {test_acc * 100:.1f}%")
-print("save successfully!")
+logging.info(f"Runtime (s): {runtime:.2f}")
+logging.info(f"Test macro F1: {test_f1 * 100:.1f}% | Test accuracy: {test_acc * 100:.1f}%")
+print(f"[SUMMARY] Runtime: {runtime:.2f}s  TestAcc: {test_acc*100:.2f}%  MacroF1: {test_f1*100:.2f}%  G-Mean(PRE)={test_gmean*100:.2f}%")
 
 if np.isnan(results[test_mask].cpu().detach().numpy()).any() == True:
     results[test_mask]=torch.tensor(np.nan_to_num(results[test_mask].cpu().detach().numpy())).to(device)
@@ -367,17 +408,21 @@ if n_classes==2:
     test_auc = roc_auc_score(labels[test_mask].cpu(), torch.softmax(results[test_mask].cpu(), dim=1)[:,1],average='macro')
 else:
     test_auc = roc_auc_score(labels[test_mask].cpu(), torch.softmax(results[test_mask].cpu(), dim=1),average='macro', multi_class='ovo')
-logging.log(23,f"Test macro AUC: {test_auc * 100:.2f}% ")
-logging.log(23,f"Test G-Mean: {test_gmean * 100:.2f}% ")
+logging.info(f"Test macro AUC: {test_auc * 100:.2f}%")
+logging.info(f"Test G-Mean: {test_gmean * 100:.2f}%")
 
 
 target_names=['{}'.format(i) for i in range(n_classes)]
 report = classification_report(labels[test_mask].cpu().detach().numpy(), test_h.cpu().detach().numpy(), target_names=target_names, digits=4)
-logging.log(23,f"\nReport=:\n {report}")
+print("\n===== Classification Report =====")
+print(report)
+print("=================================")
 
 
 recall = recall_score(labels[test_mask].cpu().detach().numpy(), test_h.cpu().detach().numpy(), average='macro')
-logging.log(24, f"AUC:{test_auc:.4f},F1:{test_f1:.4f},Recall:{recall:.4f},G-mean:{test_gmean:.4f}")
+logging.info(f"AUC:{test_auc:.4f}, F1:{test_f1:.4f}, Recall:{recall:.4f}, G-mean:{test_gmean:.4f}")
+print(f"AUC:{test_auc:.4f}, F1:{test_f1:.4f}, Recall:{recall:.4f}, G-mean:{test_gmean:.4f}")
+print("save successfully! Final metrics printed above.")
 
 test_h_list = test_h.tolist()
 labels_list = labels[test_mask].tolist()
